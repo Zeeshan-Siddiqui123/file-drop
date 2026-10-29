@@ -10,6 +10,9 @@ export default defineConfig({
       '/socket.io': {
         target: 'http://localhost:3001',
       },
+      '/ice-servers': {
+        target: 'http://localhost:3001',
+      },
     },
   },
 })

@@ -32,11 +32,17 @@ Deployment configuration is included for Render (signaling backend) and Vercel (
 
 1. Push the repository to GitHub.
 2. In Vercel, import the repository and set **Root Directory** to `Frontend`. Set `VITE_SIGNALING_URL` to the public HTTPS origin of the Render backend, for example `https://swiftdrop-signaling.onrender.com`, then deploy. `Frontend/vercel.json` configures the Vite build and output directory.
-3. In Render, create a Blueprint from the repository using `render.yaml`. Set `CORS_ORIGIN` to the exact deployed Vercel origin, such as `https://your-project.vercel.app` (no path or trailing slash). The backend starts in production only when this value is configured. Render supplies `PORT`; do not set it yourself.
+3. In Render, create a Blueprint from the repository using `render.yaml`. Set `CORS_ORIGIN` to the deployed Vercel origin, such as `https://your-project.vercel.app`. The backend normalizes trailing slashes. The backend starts in production only when this value is configured. Render supplies `PORT`; do not set it yourself.
 4. If either provider assigns a different service URL, update the corresponding environment variable and redeploy: Vercel's `VITE_SIGNALING_URL` must be the backend HTTPS origin, and Render's `CORS_ORIGIN` must contain the frontend origin. For multiple frontend origins, separate them with commas.
 5. Open the Vercel HTTPS URL on both devices and test pairing and file transfer. Large-file saving still depends on the phone browser's File System Access API support.
 
 The `.env.example` files document the required deployment variables. For local development, no environment setup is needed: the frontend uses Vite's local signaling proxy. Do not copy production example values into `.env.local` for local development. Never commit real `.env` files; the root `.gitignore` excludes them. Any variable prefixed with `VITE_` is included in client-side code and must not contain secrets.
+
+### TURN relay setup
+
+STUN alone cannot connect peers on every network. For a Metered TURN account, set backend-only `METERED_DOMAIN` to the app's HTTPS origin (for example `https://your-app.metered.live`) and `METERED_TURN_API_KEY` to the TURN credential's API key. The backend calls Metered's credential-scoped `/api/v1/turn/credentials` endpoint and returns the ICE server list; the API key stays server-side. Do not put it in a `VITE_` variable. For Coturn instead, set `TURN_URLS` to its comma-separated `turn:`/`turns:` URLs and `TURN_SHARED_SECRET` to the server-side REST-auth secret. Optionally set `TURN_CREDENTIAL_TTL_SECONDS` (60–86400; default 3600). Configure either Metered or Coturn, not both. Redeploy the backend and frontend after configuration. TURN can relay the file itself, so account for provider bandwidth charges.
+
+The current transfer protocol does not support resuming after a peer connection drops. A failed transfer must be started again.
 
 The room code is randomly generated, valid for ten minutes and limited to two peers. The signaling server allows up to six room-join attempts per socket connection. Use HTTPS in production; browsers require a secure context for features such as clipboard and direct-to-disk saving.
 
@@ -56,4 +62,4 @@ npm run lint
 npm run build
 ```
 
-The backend exposes `GET /healthz` for hosting health checks.
+The backend exposes `GET /healthz` for hosting health checks and `GET /ice-servers` for browser ICE configuration.

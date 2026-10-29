@@ -159,7 +159,27 @@ function App() {
   }
 
   useEffect(() => {
-    const socket = io(import.meta.env.VITE_SIGNALING_URL || undefined, {
+    const signalingOrigin = import.meta.env.VITE_SIGNALING_URL
+      ? new URL(import.meta.env.VITE_SIGNALING_URL).origin
+      : window.location.origin
+    let iceServersPromise: Promise<RTCIceServer[]> | null = null
+    const loadIceServers = () => {
+      iceServersPromise ??= fetch(new URL('/ice-servers', `${signalingOrigin}/`))
+        .then(async (response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          const result = await response.json() as { iceServers?: RTCIceServer[] }
+          if (!Array.isArray(result.iceServers) || result.iceServers.length === 0) {
+            throw new Error('The signaling service returned no ICE servers.')
+          }
+          return result.iceServers
+        })
+        .catch((cause: unknown) => {
+          iceServersPromise = null
+          throw cause
+        })
+      return iceServersPromise
+    }
+    const socket = io(import.meta.env.VITE_SIGNALING_URL ? signalingOrigin : undefined, {
       transports: import.meta.env.DEV ? ['polling'] : ['websocket', 'polling'],
       reconnection: true,
       reconnectionAttempts: Infinity,
@@ -169,7 +189,7 @@ function App() {
     })
     socketRef.current = socket
 
-    const createConnection = (targetPeerId: string) => {
+    const createConnection = async (targetPeerId: string) => {
       const attachDataChannel = (channel: RTCDataChannel) => {
         dataChannelRef.current = channel
         channel.binaryType = 'arraybuffer'
@@ -238,9 +258,7 @@ function App() {
       }
 
       peerIdRef.current = targetPeerId
-      const connection = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-      })
+      const connection = new RTCPeerConnection({ iceServers: await loadIceServers() })
       peerConnectionRef.current = connection
       connection.onicecandidate = (event) => {
         if (event.candidate) {
@@ -252,7 +270,7 @@ function App() {
       }
       connection.onconnectionstatechange = () => {
         if (connection.connectionState === 'failed') {
-          setError('Could not establish a direct connection. This network may require a TURN relay.')
+          setError('The peer connection failed. Check that TURN is configured on the signaling server and try again; an interrupted transfer cannot resume.')
         }
       }
       connection.ondatachannel = (event) => attachDataChannel(event.channel)
@@ -409,22 +427,24 @@ function App() {
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
     }
 
-    const startOffer = (newPeer: Peer) => {
+    const startOffer = async (newPeer: Peer) => {
       if (peerConnectionRef.current) return
       setPeer(newPeer)
-      const { connection, attachDataChannel } = createConnection(newPeer.peerId)
-      attachDataChannel(connection.createDataChannel('file-transfer', { ordered: true }))
-      void connection.createOffer()
-        .then((offer) => connection.setLocalDescription(offer))
-        .then(() => {
-          if (connection.localDescription) {
-            socket.emit('signal-offer', {
-              toPeerId: newPeer.peerId,
-              description: connection.localDescription,
-            })
-          }
-        })
-        .catch(() => setError('Could not start the secure peer connection. Please retry.'))
+      try {
+        const { connection, attachDataChannel } = await createConnection(newPeer.peerId)
+        attachDataChannel(connection.createDataChannel('file-transfer', { ordered: true }))
+        const offer = await connection.createOffer()
+        await connection.setLocalDescription(offer)
+        if (connection.localDescription) {
+          socket.emit('signal-offer', {
+            toPeerId: newPeer.peerId,
+            description: connection.localDescription,
+          })
+        }
+      } catch (cause) {
+        const details = cause instanceof Error ? cause.message : 'unknown error'
+        setError(`Could not load peer connection settings: ${details}. Configure TURN on the signaling server and retry.`)
+      }
     }
 
     socket.on('connect', () => {
@@ -461,7 +481,7 @@ function App() {
     })
     socket.on('signal-offer', async ({ fromPeerId, description }: { fromPeerId: string; description: RTCSessionDescriptionInit }) => {
       try {
-        const { connection } = createConnection(fromPeerId)
+        const { connection } = await createConnection(fromPeerId)
         await connection.setRemoteDescription(description)
         remoteDescriptionReadyRef.current = true
         for (const candidate of pendingCandidatesRef.current.splice(0)) {
@@ -472,8 +492,9 @@ function App() {
         if (connection.localDescription) {
           socket.emit('signal-answer', { toPeerId: fromPeerId, description: connection.localDescription })
         }
-      } catch {
-        setError('Could not answer the connection request. Please create a new room.')
+      } catch (cause) {
+        const details = cause instanceof Error ? cause.message : 'unknown error'
+        setError(`Could not establish the peer connection: ${details}. Check the signaling and TURN configuration, then retry.`)
       }
     })
     socket.on('signal-answer', async ({ fromPeerId, description }: { fromPeerId: string; description: RTCSessionDescriptionInit }) => {

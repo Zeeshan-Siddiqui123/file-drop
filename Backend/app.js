@@ -1,9 +1,11 @@
 const express = require('express');
 const http = require('node:http');
+const { createHmac, randomBytes } = require('node:crypto');
 const { Server } = require('socket.io');
 
 const PORT = Number(process.env.PORT) || 3001;
 const ROOM_CODE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/;
+const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 const MAX_ROOMS_PER_SOCKET = 6;
 const ROOM_TTL_MS = 10 * 60 * 1000;
 const rooms = new Map();
@@ -18,12 +20,117 @@ app.get('/healthz', (_request, response) => {
 
 const server = http.createServer(app);
 const configuredOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(',').map((origin) => origin.trim())
+  ? process.env.CORS_ORIGIN.split(',').map((origin) => {
+    try {
+      return new URL(origin.trim()).origin;
+    } catch {
+      throw new Error(`Invalid origin in CORS_ORIGIN: ${origin}`);
+    }
+  })
   : null;
+const turnUrls = process.env.TURN_URLS
+  ? process.env.TURN_URLS.split(',').map((url) => url.trim()).filter(Boolean)
+  : [];
+const turnSharedSecret = process.env.TURN_SHARED_SECRET;
+const meteredDomain = process.env.METERED_DOMAIN;
+const meteredTurnApiKey = process.env.METERED_TURN_API_KEY;
+const turnCredentialTtlSeconds = Number(process.env.TURN_CREDENTIAL_TTL_SECONDS) || 3600;
+
+if (Boolean(meteredDomain) !== Boolean(meteredTurnApiKey)) {
+  throw new Error('Set both METERED_DOMAIN and METERED_TURN_API_KEY to use Metered TURN.');
+}
+if (meteredDomain) {
+  let parsedMeteredDomain;
+  try {
+    parsedMeteredDomain = new URL(meteredDomain);
+  } catch {
+    throw new Error('METERED_DOMAIN must be a valid HTTPS origin.');
+  }
+  if (parsedMeteredDomain.protocol !== 'https:' || parsedMeteredDomain.pathname !== '/' || parsedMeteredDomain.search || parsedMeteredDomain.hash) {
+    throw new Error('METERED_DOMAIN must be an HTTPS origin without a path, query, or fragment.');
+  }
+}
+if (meteredTurnApiKey && (turnUrls.length > 0 || turnSharedSecret)) {
+  throw new Error('Configure either Metered TURN credentials or TURN_URLS/TURN_SHARED_SECRET, not both.');
+}
+if (turnUrls.length > 0 && !turnSharedSecret) {
+  throw new Error('Set TURN_SHARED_SECRET when TURN_URLS is configured.');
+}
+if (turnUrls.some((url) => !/^turns?:/i.test(url))) {
+  throw new Error('TURN_URLS must contain only turn: or turns: URLs.');
+}
+if (!Number.isInteger(turnCredentialTtlSeconds) || turnCredentialTtlSeconds < 60 || turnCredentialTtlSeconds > 86_400) {
+  throw new Error('TURN_CREDENTIAL_TTL_SECONDS must be an integer between 60 and 86400.');
+}
 
 if (process.env.NODE_ENV === 'production' && !configuredOrigins) {
   throw new Error('Set CORS_ORIGIN to the frontend origin before starting in production.');
 }
+
+app.get('/ice-servers', async (request, response) => {
+  const requestOrigin = request.get('origin');
+  if (requestOrigin) {
+    let normalizedOrigin;
+    try {
+      normalizedOrigin = new URL(requestOrigin).origin;
+    } catch {
+      response.status(403).json({ error: 'Origin is not allowed.' });
+      return;
+    }
+    if (configuredOrigins && !configuredOrigins.includes(normalizedOrigin)) {
+      response.status(403).json({ error: 'Origin is not allowed.' });
+      return;
+    }
+    response.set('Access-Control-Allow-Origin', normalizedOrigin);
+    response.vary('Origin');
+  } else if (process.env.NODE_ENV === 'production') {
+    response.status(403).json({ error: 'An allowed browser origin is required.' });
+    return;
+  }
+
+  if (meteredDomain && meteredTurnApiKey) {
+    try {
+      const credentialUrl = new URL('/api/v1/turn/credentials', meteredDomain);
+      credentialUrl.searchParams.set('apiKey', meteredTurnApiKey);
+      const providerResponse = await fetch(credentialUrl, { signal: AbortSignal.timeout(10_000) });
+      if (!providerResponse.ok) {
+        response.status(502).json({ error: `TURN provider returned HTTP ${providerResponse.status}.` });
+        return;
+      }
+      const iceServers = await providerResponse.json();
+      if (
+        !Array.isArray(iceServers) ||
+        iceServers.length === 0 ||
+        iceServers.some((iceServer) =>
+          !iceServer ||
+          (typeof iceServer.urls !== 'string' && !Array.isArray(iceServer.urls)) ||
+          (iceServer.username !== undefined && typeof iceServer.username !== 'string') ||
+          (iceServer.credential !== undefined && typeof iceServer.credential !== 'string'),
+        )
+      ) {
+        response.status(502).json({ error: 'TURN provider returned invalid ICE server configuration.' });
+        return;
+      }
+      response.set('Cache-Control', 'no-store');
+      response.json({ iceServers });
+      return;
+    } catch (error) {
+      console.error('Could not retrieve TURN configuration from the provider:', error.message);
+      response.status(502).json({ error: 'Could not retrieve TURN configuration from the provider.' });
+      return;
+    }
+  }
+
+  const iceServers = [...DEFAULT_ICE_SERVERS];
+  if (turnUrls.length > 0 && turnSharedSecret) {
+    const expiresAt = Math.floor(Date.now() / 1000) + turnCredentialTtlSeconds;
+    const username = `${expiresAt}:${randomBytes(12).toString('hex')}`;
+    const credential = createHmac('sha1', turnSharedSecret).update(username).digest('base64');
+    iceServers.push({ urls: turnUrls, username, credential });
+  }
+  response.set('Cache-Control', 'no-store');
+  response.json({ iceServers });
+});
 
 const io = new Server(server, {
   cors: {
