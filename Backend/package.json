@@ -1,0 +1,18 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "Room-based WebRTC signaling server for P2P file transfers",
+  "main": "app.js",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env app.js",
+    "dev": "node --watch --env-file-if-exists=.env app.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.3.0",
+    "socket.io": "^4.8.1"
+  }
+}
